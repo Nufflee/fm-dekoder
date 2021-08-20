@@ -6,7 +6,7 @@ Currently, in order to run this project, you will need to have a functional RTL-
 
 ## Building
 
-Currently the project only supports Windows but that will be changed in the future.
+Currently the project only supports Windows but that will be changed in the future. In order to build and run the project, you will need [MinGW](http://mingw-w64.org/doku.php).
 
 ```bash
 make fm
