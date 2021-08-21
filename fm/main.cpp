@@ -6,6 +6,7 @@
 #include <cmath>
 #include <concepts>
 #include <limits>
+#include <vector>
 #include "wave.hpp"
 #include "coeffs.h"
 
@@ -34,10 +35,12 @@ T mod_floor(T dividend, T divisor)
   return dividend - divisor * std::floor(dividend / divisor);
 }
 
-int main()
-{
-  rtlsdr_dev_t *device;
+#define RTLSDR_CALL(x) assert(x == 0);
 
+rtlsdr_dev_t *device;
+
+void initialize_rtlsdr()
+{
   uint32_t deviceCount = rtlsdr_get_device_count();
 
   printf("Found %d device(s)\n", deviceCount);
@@ -48,58 +51,110 @@ int main()
     exit(-1);
   }
 
-  assert(rtlsdr_open(&device, 0) == 0);
+  RTLSDR_CALL(rtlsdr_open(&device, 0));
   assert(device);
-
-  rtlsdr_set_center_freq(device, MHZ(102.5f));
-  assert(rtlsdr_set_sample_rate(device, SAMPLE_RATE) == 0);
-
-  rtlsdr_set_tuner_gain_mode(device, 1);
-  assert(rtlsdr_set_tuner_gain(device, 496) == 0);
 
   printf("RTL-SDR device initialized!\n");
 
-  int iqSamplesRead;
+  RTLSDR_CALL(rtlsdr_set_tuner_gain_mode(device, 1));
+  RTLSDR_CALL(rtlsdr_set_tuner_gain(device, 496));
 
   // ALWAYS have to do this before calling read(_sync)
-  rtlsdr_reset_buffer(device);
+  RTLSDR_CALL(rtlsdr_reset_buffer(device));
+}
 
-#define SAMPLE_LENGTH_SEC 5
-#define SAMPLE_COUNT (SAMPLE_RATE * SAMPLE_LENGTH_SEC)
-#define READ_BUFFER_SIZE (SAMPLE_COUNT * 2)
+std::vector<uint8_t> acquire_samples_from_sdr(uint32_t frequency, uint32_t sampleRate, int sampleCount)
+{
+  RTLSDR_CALL(rtlsdr_set_center_freq(device, frequency));
+  RTLSDR_CALL(rtlsdr_set_sample_rate(device, sampleRate));
 
-  uint8_t *iqReadBuffer = new uint8_t[READ_BUFFER_SIZE];
+  int bufferSize = sampleCount * 2;
+  std::vector<uint8_t> iqReadBuffer;
 
-  printf("Acquiring %d IQ samples...\n", SAMPLE_COUNT);
+  iqReadBuffer.resize(bufferSize);
+
+  printf("Acquiring %d IQ samples...\n", bufferSize);
+
+  int iqSamplesRead = 0;
 
   // Read data from the SDR
-  assert(rtlsdr_read_sync(device, iqReadBuffer, READ_BUFFER_SIZE, &iqSamplesRead) == 0);
-  assert(iqSamplesRead == READ_BUFFER_SIZE);
+  RTLSDR_CALL(rtlsdr_read_sync(device, iqReadBuffer.data(), bufferSize, &iqSamplesRead));
+  assert(iqSamplesRead == bufferSize);
 
-  float *iqReadBufferFloat = new float[READ_BUFFER_SIZE];
+  return iqReadBuffer;
+}
+
+std::vector<uint8_t> read_samples_from_file(const char *path)
+{
+  std::ifstream file;
+
+  file.open(path, std::ios::in | std::ios::binary | std::ios::ate);
+
+  if (!file.is_open())
+  {
+    fprintf(stderr, "Couldn't open file `%s` Sadge: %s", path, std::strerror(errno));
+    exit(-1);
+  }
+
+  size_t size = file.tellg();
+
+  file.seekg(0, std::ios::beg);
+
+  std::vector<uint8_t> iqBuffer;
+  iqBuffer.resize(size);
+
+  assert(file.read(reinterpret_cast<char *>(iqBuffer.data()), size));
+
+  return iqBuffer;
+}
+
+int main(int argc, char **argv)
+{
+  std::vector<uint8_t> iqBuffer;
+
+  if (argc == 1)
+  {
+    iqBuffer = acquire_samples_from_sdr(MHZ(102.5f), SAMPLE_RATE, SAMPLE_RATE * 5 /* sec */);
+  }
+  else if (argc == 2)
+  {
+    iqBuffer = read_samples_from_file(argv[1]);
+
+    printf("%d IQ samples read from `%s`.\n", iqBuffer.size() / 2, argv[1]);
+  }
+  else
+  {
+    fprintf(stderr, "Expected at most 1 argument\nUsage: fm.exe <iq-file>\n");
+    exit(-1);
+  }
+
+  assert(iqBuffer.size() % 2 == 0);
+
+  float *iqBufferFloat = new float[iqBuffer.size()];
 
   printf("Preprocessing read samples...\n");
 
   // Map uint8_t[0, 255] -> float[-127.5, 127.5]
-  for (uint32_t i = 0; i < READ_BUFFER_SIZE; i++)
+  for (uint32_t i = 0; i < iqBuffer.size(); i++)
   {
-    iqReadBufferFloat[i] = (float)iqReadBuffer[i] - 127.5f;
+    iqBufferFloat[i] = (float)iqBuffer[i] - 127.5f;
   }
 
   printf("Demodulating FM...\n");
 
-  float *angles = new float[SAMPLE_COUNT];
+  uint32_t sampleCount = iqBuffer.size() / 2;
+  float *angles = new float[sampleCount];
 
   // Compute the phase angle of each sample
-  for (uint32_t i = 0; i < READ_BUFFER_SIZE; i += 2)
+  for (uint32_t i = 0; i < iqBuffer.size(); i += 2)
   {
-    angles[i / 2] = atan2f(iqReadBufferFloat[i + 1], iqReadBufferFloat[i]);
+    angles[i / 2] = atan2f(iqBufferFloat[i + 1], iqBufferFloat[i]);
   }
 
-  float *rotations = new float[SAMPLE_COUNT - 1];
+  float *rotations = new float[sampleCount - 1];
 
   // Compute the derivative of the phase angle for each sample
-  for (uint32_t i = 0; i < SAMPLE_COUNT - 1; i++)
+  for (uint32_t i = 0; i < sampleCount - 1; i++)
   {
     rotations[i] = angles[i + 1] - angles[i];
 
@@ -114,7 +169,7 @@ int main()
   // Decimate to ~44.1 kHz
   uint32_t decimationFactor = roundf((float)SAMPLE_RATE / (float)KHZ(44.1));
   uint32_t decimatedSampleRate = SAMPLE_RATE / decimationFactor;
-  uint32_t decimatedSampleCount = (SAMPLE_COUNT - 1) / decimationFactor;
+  uint32_t decimatedSampleCount = (sampleCount - 1) / decimationFactor;
 
   printf("Low-pass filtering and decimating...\n");
 
@@ -125,7 +180,7 @@ int main()
   float decimatedMin = std::numeric_limits<float>::max();
   float decimatedMax = std::numeric_limits<float>::min();
 
-  for (uint32_t i = 0; i < SAMPLE_COUNT - 1; i += decimationFactor)
+  for (uint32_t i = 0; i < sampleCount - 1; i += decimationFactor)
   {
     if (i < ARRAY_SIZE(coeffs))
     {
@@ -169,15 +224,15 @@ int main()
     }
   };
 
-  uint8_t *rawSamples = new uint8_t[SAMPLE_COUNT - 1];
-  map_float(rotations, rawSamples, SAMPLE_COUNT - 1);
+  uint8_t *rawSamples = new uint8_t[sampleCount - 1];
+  map_float(rotations, rawSamples, sampleCount - 1);
 
   uint8_t *decimatedSamples = new uint8_t[decimatedSampleCount];
   map_float(decimatedRotations, decimatedSamples, decimatedSampleCount);
 
   // Per, the WAVE standard 8-bit samples are always unsigned, but 16-bit samples are always signed.
-  int16_t *rawSamples16 = new int16_t[SAMPLE_COUNT - 1];
-  map_float(rotations, rawSamples16, SAMPLE_COUNT - 1);
+  int16_t *rawSamples16 = new int16_t[sampleCount - 1];
+  map_float(rotations, rawSamples16, sampleCount - 1);
 
   int16_t *decimatedSamples16 = new int16_t[decimatedSampleCount];
   map_float(decimatedRotations, decimatedSamples16, decimatedSampleCount);
@@ -189,7 +244,7 @@ int main()
   decimatedWave.set_data(decimatedSamples);
   decimatedWave.write_to_file("decimated-audio.wav");
 
-  Wave<uint8_t> rawWave(WaveFormat::PCM, 1, SAMPLE_RATE, SAMPLE_COUNT - 1);
+  Wave<uint8_t> rawWave(WaveFormat::PCM, 1, SAMPLE_RATE, sampleCount - 1);
 
   rawWave.set_data(rawSamples);
   rawWave.write_to_file("raw-audio.wav");
@@ -199,7 +254,7 @@ int main()
   decimatedWave16.set_data(decimatedSamples16);
   decimatedWave16.write_to_file("decimated-audio16.wav");
 
-  Wave<int16_t> rawWave16(WaveFormat::PCM, 1, SAMPLE_RATE, SAMPLE_COUNT - 1);
+  Wave<int16_t> rawWave16(WaveFormat::PCM, 1, SAMPLE_RATE, sampleCount - 1);
 
   rawWave16.set_data(rawSamples16);
   rawWave16.write_to_file("raw-audio16.wav");
@@ -216,7 +271,7 @@ int main()
 
   fwrite(buffer, 1, length, file);
 
-  for (uint32_t i = 0; i < SAMPLE_COUNT - 1; i++)
+  for (uint32_t i = 0; i < sampleCount - 1; i++)
   {
     int length = sprintf(buffer, "%f\n", decimatedRotations[i]);
     assert(length <= 16);
