@@ -1,12 +1,12 @@
 #include <rtl-sdr.h>
 #include <cstdio>
 #include <cstdlib>
-#include <cassert>
 #define _USE_MATH_DEFINES
 #include <cmath>
 #include <concepts>
 #include <limits>
 #include <vector>
+#include "assert.hpp"
 #include "wave.hpp"
 #include "coeffs.h"
 
@@ -35,7 +35,7 @@ T mod_floor(T dividend, T divisor)
   return dividend - divisor * std::floor(dividend / divisor);
 }
 
-#define RTLSDR_CALL(x) assert(x == 0);
+#define RTLSDR_CALL(x) ASSERT_EQ(x, 0);
 
 rtlsdr_dev_t *device;
 
@@ -52,7 +52,7 @@ void initialize_rtlsdr()
   }
 
   RTLSDR_CALL(rtlsdr_open(&device, 0));
-  assert(device);
+  ASSERT(device);
 
   printf("RTL-SDR device initialized!\n");
 
@@ -79,7 +79,7 @@ std::vector<uint8_t> acquire_samples_from_sdr(uint32_t frequency, uint32_t sampl
 
   // Read data from the SDR
   RTLSDR_CALL(rtlsdr_read_sync(device, iqReadBuffer.data(), bufferSize, &iqSamplesRead));
-  assert(iqSamplesRead == bufferSize);
+  ASSERT_EQ(iqSamplesRead, bufferSize);
 
   return iqReadBuffer;
 }
@@ -103,7 +103,7 @@ std::vector<uint8_t> read_samples_from_file(const char *path)
   std::vector<uint8_t> iqBuffer;
   iqBuffer.resize(size);
 
-  assert(file.read(reinterpret_cast<char *>(iqBuffer.data()), size));
+  ASSERT(file.read(reinterpret_cast<char *>(iqBuffer.data()), size));
 
   return iqBuffer;
 }
@@ -114,13 +114,15 @@ int main(int argc, char **argv)
 
   if (argc == 1)
   {
+    initialize_rtlsdr();
+
     iqBuffer = acquire_samples_from_sdr(MHZ(102.5f), SAMPLE_RATE, SAMPLE_RATE * 5 /* sec */);
   }
   else if (argc == 2)
   {
     iqBuffer = read_samples_from_file(argv[1]);
 
-    printf("%d IQ samples read from `%s`.\n", iqBuffer.size() / 2, argv[1]);
+    printf("%lld IQ samples read from `%s`.\n", iqBuffer.size() / 2, argv[1]);
   }
   else
   {
@@ -128,7 +130,7 @@ int main(int argc, char **argv)
     exit(-1);
   }
 
-  assert(iqBuffer.size() % 2 == 0);
+  ASSERT_EQ(iqBuffer.size() % 2, 0);
 
   float *iqBufferFloat = new float[iqBuffer.size()];
 
@@ -267,14 +269,14 @@ int main(int argc, char **argv)
   char buffer[16];
 
   int length = sprintf(buffer, "%d\n", SAMPLE_RATE);
-  assert(length <= 16);
+  ASSERT(length <= 16);
 
   fwrite(buffer, 1, length, file);
 
   for (uint32_t i = 0; i < sampleCount - 1; i++)
   {
     int length = sprintf(buffer, "%f\n", decimatedRotations[i]);
-    assert(length <= 16);
+    ASSERT(length <= 16);
 
     fwrite(buffer, 1, length, file);
   }
