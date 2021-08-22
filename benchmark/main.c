@@ -6,16 +6,16 @@
 #include <math.h>
 #include <io.h>
 #include <fcntl.h>
+#include <unistd.h>
 #include "rtl-sdr.h"
 
 #define MHZ(x) ((x)*1000 * 1000)
 #define KHZ(x) ((x)*1000)
 
 /*
-Frequency switch:
-  now: ~60 ms, ±5 ms stddev
-
-  earlier: ~50 ms, ±3 ms stddev
+Results on author's machine:
+  [benchmark_set_center_freq] - Average time is 52.427032 ms, min = 49.646000 ms, max = 88.380600 ms, stddev = ±4.706351 ms
+  [benchmark_set_sample_rate] - Average time is 115.002754 ms, min = 110.546402 ms, max = 146.712708 ms, stddev = ±5.392377 ms
 */
 
 float timespec_diff_ms(struct timespec start, struct timespec end)
@@ -23,10 +23,31 @@ float timespec_diff_ms(struct timespec start, struct timespec end)
   return (end.tv_sec - start.tv_sec) * 1e3 + (end.tv_nsec - start.tv_nsec) / 1e6;
 }
 
+typedef struct Benchmark
+{
+  const char *name;
+  void (*const func)(int i);
+  int numRuns;
+  float *times;
+} Benchmark;
+
+rtlsdr_dev_t *device;
+
+// TODO: GCC does not inline these since they are function pointers although Clang does so it is possible.
+// Is there a way to force GCC to do it too?
+// See: https://godbolt.org/z/EfYTd76cG
+static inline void benchmark_set_sample_rate(int i)
+{
+  rtlsdr_set_sample_rate(device, MHZ(i % 2 == 0 ? 1.024 : 3.2));
+}
+
+static inline void benchmark_set_center_freq(int i)
+{
+  rtlsdr_set_center_freq(device, MHZ(i % 2 == 0 ? 100 : 200));
+}
+
 int main()
 {
-  rtlsdr_dev_t *device;
-
   uint32_t deviceCount = rtlsdr_get_device_count();
 
   printf("Found %d device(s)\n", deviceCount);
@@ -37,7 +58,7 @@ int main()
     exit(-1);
   }
 
-  printf("Name of 0th device: %s\n", rtlsdr_get_device_name(0));
+  printf("Name of first device: %s\n", rtlsdr_get_device_name(0));
 
   char manufacturer[256];
   char product[256];
@@ -48,60 +69,96 @@ int main()
 
   assert(rtlsdr_open(&device, 0) == 0);
 
-  assert(rtlsdr_set_sample_rate(device, 3200000) == 0);
+  assert(rtlsdr_set_sample_rate(device, KHZ(256)) == 0);
+  assert(rtlsdr_set_center_freq(device, MHZ(69)) == 0);
 
-#define NUM_RUNS 200
+  printf("Waiting 1 second for the PLL to lock...\n");
+  sleep(1);
 
-  float times[NUM_RUNS];
+#define ARRAY_SIZE(array) sizeof(array) / sizeof(array[0])
 
-  for (int i = 0; i < NUM_RUNS; i++)
+  Benchmark benchmarks[] = {
+      {
+          .name = "benchmark_set_center_freq",
+          .func = benchmark_set_center_freq,
+          .numRuns = 200,
+      },
+      {
+          .name = "benchmark_set_sample_rate",
+          .func = benchmark_set_sample_rate,
+          .numRuns = 100,
+      }};
+
+  // Run the benchamrks
+  for (size_t i = 0; i < ARRAY_SIZE(benchmarks); i++)
   {
-    struct timespec time_start, time_end;
+    Benchmark *benchmark = &benchmarks[i];
+    float *times = malloc(benchmark->numRuns * sizeof(float));
 
-    clock_gettime(CLOCK_MONOTONIC, &time_start);
-    rtlsdr_set_center_freq(device, MHZ(100));
-    clock_gettime(CLOCK_MONOTONIC, &time_end);
+    printf("Starting `%s`:\n", benchmark->name);
 
-    times[i] = timespec_diff_ms(time_start, time_end);
-
-    printf("%d/%d: %f ms\n", i + 1, NUM_RUNS, times[i]);
-  }
-
-  float averageTime = 0;
-  float maxTime = 0;
-  float minTime = 99999;
-
-  for (int i = 0; i < NUM_RUNS; i++)
-  {
-    float time = times[i];
-
-    averageTime += time;
-
-    if (time > maxTime)
+    for (int run = 0; run < benchmark->numRuns; run++)
     {
-      maxTime = time;
+      struct timespec time_start, time_end;
+
+      clock_gettime(CLOCK_MONOTONIC, &time_start);
+      benchmark->func(i);
+      clock_gettime(CLOCK_MONOTONIC, &time_end);
+
+      times[run] = timespec_diff_ms(time_start, time_end);
+
+      printf("\t[%s]\t %d/%d: %f ms\n", benchmark->name, run + 1, benchmark->numRuns, times[run]);
     }
 
-    if (time < minTime)
-    {
-      minTime = time;
-    }
+    benchmark->times = times;
   }
 
-  averageTime /= (float)NUM_RUNS;
-
-  float standardDev = 0;
-
-  for (int i = 0; i < NUM_RUNS; i++)
+  // Compute and report the statistics
+  for (size_t i = 0; i < ARRAY_SIZE(benchmarks); i++)
   {
-    standardDev += powf(times[i] - averageTime, 2);
+    Benchmark benchmark = benchmarks[i];
+
+    float averageTime = 0;
+    float maxTime = 0;
+    float minTime = __FLT_MAX__;
+
+    for (int j = 0; j < benchmark.numRuns; j++)
+    {
+      float time = benchmark.times[j];
+
+      averageTime += time;
+
+      if (time > maxTime)
+      {
+        maxTime = time;
+      }
+
+      if (time < minTime)
+      {
+        minTime = time;
+      }
+    }
+
+    averageTime /= (float)benchmark.numRuns;
+
+    float standardDev = 0;
+
+    for (int j = 0; j < benchmark.numRuns; j++)
+    {
+      standardDev += powf(benchmark.times[j] - averageTime, 2);
+    }
+
+    standardDev = sqrtf(standardDev / benchmark.numRuns);
+
+    printf("Results:\n");
+
+    // This is required for unicode output to work.
+    _setmode(_fileno(stdout), _O_U16TEXT);
+    wprintf(L"\t[%s] - Average time is %f ms, min = %f ms, max = %f ms, stddev = ±%f ms\n", benchmark.name, averageTime, minTime, maxTime, standardDev);
+
+    free(benchmark.times);
+    benchmark.times = NULL;
   }
-
-  standardDev = sqrtf(standardDev / NUM_RUNS);
-
-  // This is required for unicode output to work.
-  _setmode(_fileno(stdout), _O_U16TEXT);
-  wprintf(L"Average time is %f ms, min = %f ms, max = %f ms, stddev = ±%f ms", averageTime, minTime, maxTime, standardDev);
 
   rtlsdr_close(device);
 }
