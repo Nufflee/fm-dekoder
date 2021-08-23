@@ -18,6 +18,9 @@ Results on author's machine:
   [benchmark_set_sample_rate] - Average time is 115.002754 ms, min = 110.546402 ms, max = 146.712708 ms, stddev = ±5.392377 ms
 */
 
+// WARNING: Defining DRY_RUN means that you will not actually run any meaningful benchmarks
+//#define DRY_RUN
+
 float timespec_diff_ms(struct timespec start, struct timespec end)
 {
   return (end.tv_sec - start.tv_sec) * 1e3 + (end.tv_nsec - start.tv_nsec) / 1e6;
@@ -36,12 +39,14 @@ rtlsdr_dev_t *device;
 // TODO: GCC does not inline these since they are function pointers although Clang does so it is possible.
 // Is there a way to force GCC to do it too?
 // See: https://godbolt.org/z/EfYTd76cG
-static inline void benchmark_set_sample_rate(int i)
+// Turns out there's ultimately no significant time difference between inlined and non-inlined code here,
+// and it's likely that GCC's optimizer simply cannot inline this no matter what.
+__attribute__((always_inline)) static inline void benchmark_set_sample_rate(int i)
 {
   rtlsdr_set_sample_rate(device, MHZ(i % 2 == 0 ? 1.024 : 3.2));
 }
 
-static inline void benchmark_set_center_freq(int i)
+__attribute__((always_inline)) static inline void benchmark_set_center_freq(int i)
 {
   rtlsdr_set_center_freq(device, MHZ(i % 2 == 0 ? 100 : 200));
 }
@@ -97,7 +102,11 @@ int main()
 
     printf("Starting `%s`:\n", benchmark->name);
 
+#ifndef DRY_RUN
     for (int run = 0; run < benchmark->numRuns; run++)
+#else
+    for (int run = 0; run < 1; run++)
+#endif
     {
       struct timespec time_start, time_end;
 
@@ -151,6 +160,11 @@ int main()
     standardDev = sqrtf(standardDev / benchmark.numRuns);
 
     printf("Results:\n");
+
+    struct timespec resolution;
+    clock_getres(CLOCK_MONOTONIC, &resolution);
+
+    printf("\tTimer resolution: %ld ns\n", resolution.tv_nsec);
 
     // This is required for unicode output to work.
     _setmode(_fileno(stdout), _O_U16TEXT);
